@@ -53,6 +53,14 @@ import org.java_websocket.handshake.ClientHandshake
 import org.java_websocket.handshake.ServerHandshake
 import org.java_websocket.server.WebSocketServer
 import org.json.JSONObject
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.TransferListener
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import kotlinx.coroutines.withContext
+import java.io.IOException
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.PlanarYUVLuminanceSource
@@ -982,7 +990,7 @@ class MainActivity : Activity() {
         // —— 播放页：选片／分发入口、起播、就绪状态列表概要（设备表）、状态行 ——
         playPage.addView(pickButton())
         // 改动六入口乙：直链输入——粘贴 http/https 直链成为本场媒体地址（入口甲为上方本地选片）
-        val linkInput = EditText(this).apply { hint = "或粘贴 http/https 直链"; styleInput(this); layoutParams = stackLp(12) }
+        val linkInput = EditText(this).apply { hint = "粘贴 B 站分享链接，或 http/https 直链"; styleInput(this); layoutParams = stackLp(12) }
         playPage.addView(linkInput)
         playPage.addView(Button(this).apply {
             text = "用此链接"
@@ -1516,12 +1524,22 @@ class MainActivity : Activity() {
     }
 
     // ---------- v0.3.1 改动六：媒体自动分发（直链入口 / 主机 HTTP 分发服务） ----------
-    /** 入口乙：直链成为本场媒体地址；主机本机直接以直链建播放器，PREPARE 时 url 原样下发。 */
+    /** 入口乙：直链成为本场媒体地址；主机本机直接以直链建播放器，PREPARE 时 url 原样下发。v0.7.0：B 站形态输入先走解析，解析所得 mp4 地址再走同一直链路径。 */
     private fun hostUseLink(url: String) {
+        if (isBiliInput(url)) {
+            setStatus("正在解析 B 站链接…")
+            scope.launch(Dispatchers.IO) { resolveBili(url) }
+            return
+        }
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
             setStatus("直链须以 http:// 或 https:// 开头")
             return
         }
+        applyHostLink(url)
+    }
+
+    /** 直链（或 B 站解析所得的 mp4 地址）成为本场媒体：与 v0.6.5 入口乙后半段行为一致。 */
+    private fun applyHostLink(url: String) {
         mediaKind = "link"
         hostLinkUrl = url
         stopMediaServer()
@@ -1529,6 +1547,104 @@ class MainActivity : Activity() {
         setupPlayer(Uri.parse(url))
         armRemotePrepareTimeout("link") // v0.3.2：主机本机直链备片同样适用 15 秒超时
         setStatus("已选直链为本场媒体，等 prepare 完成后点「准备」下发")
+    }
+
+    // ---------- v0.7.0：B 站分享链接解析（主机本地行为；免登录、无 Cookie；任一步失败只报阶段，不自动重试） ----------
+    private val BILI_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    private val BILI_REFERER = "https://www.bilibili.com"
+
+    /** B 站形态判定：裸 BV 号 / b23.tv 短链 / 含 BV 号的 bilibili.com 链接（含混在分享文本整段里的）。其余输入不拦截、按普通直链处理。 */
+    private fun isBiliInput(raw: String): Boolean {
+        val t = raw.trim()
+        if (Regex("^BV[0-9A-Za-z]{10}$").matches(t)) return true
+        val url = extractFirstHttpUrl(t) ?: return false
+        val host = Uri.parse(url).host ?: return false
+        if (host == "b23.tv") return true
+        return host.endsWith("bilibili.com") && extractBv(url) != null
+    }
+
+    private fun extractFirstHttpUrl(text: String): String? =
+        Regex("https?://\\S+").find(text)?.value?.trimEnd(')', ']', '}', '"', '\'', '。', '，')
+
+    private fun extractBv(text: String): String? =
+        Regex("BV[0-9A-Za-z]{10}").find(text)?.value
+
+    private fun extractPageNo(url: String): Int =
+        Regex("[?&]p=(\\d+)").find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+
+    private class BiliHttp(val status: Int, val body: String, val finalUrl: String)
+
+    /** B 站接口 GET：桌面 UA + Referer，不带 Cookie；跟随重定向并回报最终地址。 */
+    private fun biliHttpGet(url: String): BiliHttp {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.instanceFollowRedirects = true
+        conn.connectTimeout = 10000
+        conn.readTimeout = 15000
+        conn.setRequestProperty("User-Agent", BILI_UA)
+        conn.setRequestProperty("Referer", BILI_REFERER)
+        val status = conn.responseCode
+        val stream = if (status in 200..299) conn.inputStream else conn.errorStream
+        val body = stream?.bufferedReader()?.readText() ?: ""
+        val finalUrl = conn.url?.toString() ?: url
+        conn.disconnect()
+        return BiliHttp(status, body, finalUrl)
+    }
+
+    private suspend fun biliFail(stage: String, code: Any) {
+        klog("BILI resolve fail stage=$stage code=$code")
+        withContext(Dispatchers.Main) { setStatus("B 站解析失败（阶段 $stage，code=$code）") }
+    }
+
+    /** 解析主链：形态归一（b23.tv 跟随重定向抽 BV 与分 P）→ view 取 cid 与标题 → playurl 取单文件 mp4 地址。 */
+    private suspend fun resolveBili(raw: String) {
+        val t = raw.trim()
+        var bvid: String? = if (Regex("^BV[0-9A-Za-z]{10}$").matches(t)) t else null
+        var page = 1
+        if (bvid == null) {
+            val link = extractFirstHttpUrl(t)
+            if (link == null) { biliFail("redirect", "nolink"); return }
+            val host = Uri.parse(link).host ?: ""
+            if (host == "b23.tv") {
+                val r = try { biliHttpGet(link) } catch (e: Exception) { biliFail("redirect", "io"); return }
+                if (r.status != 200) { biliFail("redirect", r.status); return }
+                bvid = extractBv(r.finalUrl)
+                page = extractPageNo(r.finalUrl)
+            } else {
+                bvid = extractBv(link)
+                page = extractPageNo(link)
+            }
+        }
+        val bv = bvid
+        if (bv == null) { biliFail("redirect", "nobv"); return }
+        val v = try { biliHttpGet("https://api.bilibili.com/x/web-interface/view?bvid=$bv") } catch (e: Exception) { biliFail("view", "io"); return }
+        if (v.status != 200) { biliFail("view", v.status); return }
+        val vj = try { JSONObject(v.body) } catch (e: Exception) { biliFail("view", "badjson"); return }
+        val vcode = vj.optInt("code", -1)
+        if (vcode != 0) { biliFail("view", vcode); return }
+        val data = vj.optJSONObject("data")
+        val title = data?.optString("title") ?: ""
+        var cid = data?.optLong("cid", 0) ?: 0
+        if (page > 1) {
+            val pages = data?.optJSONArray("pages")
+            val pc = if (pages != null && page <= pages.length()) pages.optJSONObject(page - 1)?.optLong("cid", 0) ?: 0 else 0
+            if (pc > 0) cid = pc
+        }
+        if (cid <= 0L || title.isEmpty()) { biliFail("view", "field"); return }
+        val pu = try { biliHttpGet("https://api.bilibili.com/x/player/playurl?bvid=$bv&cid=$cid&qn=80&fnval=1") } catch (e: Exception) { biliFail("playurl", "io"); return }
+        if (pu.status != 200) { biliFail("playurl", pu.status); return }
+        val pj = try { JSONObject(pu.body) } catch (e: Exception) { biliFail("playurl", "badjson"); return }
+        val pcode = pj.optInt("code", -1)
+        if (pcode != 0) { biliFail("playurl", pcode); return }
+        val pdata = pj.optJSONObject("data")
+        val quality = pdata?.optInt("quality", 0) ?: 0
+        val durl = pdata?.optJSONArray("durl")
+        val playUrl = if (durl != null && durl.length() > 0) durl.optJSONObject(0)?.optString("url") ?: "" else ""
+        if (playUrl.isEmpty()) { biliFail("playurl", "field"); return }
+        klog("BILI resolve ok title=$title quality=$quality chost=${Uri.parse(playUrl).host}")
+        withContext(Dispatchers.Main) {
+            applyHostLink(playUrl)
+            setStatus("B 站视频：$title")
+        }
     }
 
     /** 本轮 PREPARE 的 url：直链用直链；本地文件且有从机连接时启动分发服务用分发地址；否则 local-file 占位。 */
@@ -2555,6 +2671,51 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- v0.7.0：播放侧请求头——bilivideo/upos 域名带 B 站 Referer 与桌面 UA（无此头 CDN 回 403），其余地址走默认数据源、行为与旧版一致 ----------
+    private inner class BiliAwareDataSourceFactory : DataSource.Factory {
+        override fun createDataSource(): DataSource = BiliAwareDataSource(this@MainActivity)
+    }
+
+    private inner class BiliAwareDataSource(context: Context) : DataSource {
+        private val biliHttpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(BILI_UA)
+            .setDefaultRequestProperties(mapOf("Referer" to BILI_REFERER))
+        private val defaultFactory = DefaultDataSource.Factory(context)
+        private val listeners = ArrayList<TransferListener>()
+        private var delegate: DataSource? = null
+
+        override fun addTransferListener(transferListener: TransferListener) {
+            listeners.add(transferListener)
+            delegate?.addTransferListener(transferListener)
+        }
+
+        @Throws(IOException::class)
+        override fun open(dataSpec: DataSpec): Long {
+            val host = dataSpec.uri.host ?: ""
+            val bili = host.contains("bilivideo") || host.contains("upos")
+            val d = (if (bili) biliHttpFactory else defaultFactory).createDataSource()
+            for (l in listeners) d.addTransferListener(l)
+            delegate = d
+            return d.open(dataSpec)
+        }
+
+        @Throws(IOException::class)
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            val d = delegate ?: throw IOException("BiliAwareDataSource read before open")
+            return d.read(buffer, offset, length)
+        }
+
+        override fun getUri(): Uri? = delegate?.uri
+
+        override fun getResponseHeaders(): Map<String, List<String>> = delegate?.responseHeaders ?: emptyMap()
+
+        @Throws(IOException::class)
+        override fun close() {
+            delegate?.close()
+            delegate = null
+        }
+    }
+
     private fun setupPlayer(uri: Uri) {
         remoteTimeoutJob?.cancel() // v0.3.2：新一轮备片作废旧的远程超时计时（流式路径在建播放器后重新 arm）
         player?.release()
@@ -2564,7 +2725,9 @@ class MainActivity : Activity() {
         trackSelector.setParameters(
             trackSelector.buildUponParameters().setMaxVideoSize(dm.widthPixels, dm.heightPixels)
         )
-        val p = ExoPlayer.Builder(this).setTrackSelector(trackSelector).build()
+        val p = ExoPlayer.Builder(this).setTrackSelector(trackSelector)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(BiliAwareDataSourceFactory()))
+            .build()
         klog("TRACKCAP max=${dm.widthPixels}x${dm.heightPixels} screen=${dm.widthPixels}x${dm.heightPixels}")
         player = p
         p.setVideoTextureView(textureView)

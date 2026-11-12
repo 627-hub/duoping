@@ -154,3 +154,10 @@
 - **断开释放、可复用**：从机连接断开（WebSocket 关闭）时，其编号即释放回池，后入会者可复用同一编号。编号与连接同生命周期，不为已断开设备保留。按编号索引的全部状态（就绪表、备片失败表、退出标记、设备尺寸、互传对端状态）随断开一并清理，复用该编号的新连接不继承前任任何状态。
 - **退出播放不释放**：`EXIT_PLAYBACK`（第 14 节）只退播放、连接保持，该从机编号**不释放**；其重新入场（重新 READY/START）沿用原编号。
 - **不变量**：任一时刻已连接从机的编号互不相同；布局、就绪判定与重排的活跃集口径（第 14 节）不变，仍以当前连接与标记的实时状态为准。
+
+## 17. v1.10 增补（v0.7.0 实现）
+
+本节为 v0.7.0 的一项增补：`PREPARE.url` 的取值来源扩展与播放侧请求头规则。协议不新增消息，解析是主机本地行为，其余各节不变。
+
+- **`PREPARE.url` 可为 B 站解析后的 CDN 地址**：主机在「链接」入口收到 B 站形态输入（b23.tv 短链接、`bilibili.com/video/BV…` 链接、裸 BV 号、混有上述链接的 App 分享文本）时，先在主机本地完成解析（免登录、无 Cookie，桌面 UA＋Referer 调 `x/web-interface/view` 取 cid 与标题，再调 `x/player/playurl`（qn=80、fnval=1）取单文件 mp4 地址），随后与普通直链同路：主机本机以该地址备片，`PREPARE.url` 原样下发该 CDN 地址，从机以既有直链流式路径直接从 B 站 CDN 拉流播放。解析任一步失败，主机只在状态栏与日志报失败阶段（`BILI resolve fail stage=<redirect|view|playurl> code=<原始 code 或 http 状态>`），不发 PREPARE、不自动重试（上限 1 次，本版实现为 0 次）。成功记日志 `BILI resolve ok title=<标题> quality=<playurl 返回的 quality 数值> chost=<播放地址 host>`。解析所得地址随 B 站签名时效过期，口径与既有直链一致：建会解析、立即使用、不缓存。
+- **播放侧请求头规则**：任一端（含主机本地备片）以 media3 播放时，若流地址的 host 含 `bilivideo` 或含 `upos`，数据源必须附加 `Referer: https://www.bilibili.com` 与桌面 Chrome UA（与解析侧同一 UA）——B 站 CDN 无此 Referer 回 403（实测：无 Referer 403、带 Referer 206）。其他来源地址（主机分发、普通直链、本地文件）不得附加这两个头。
