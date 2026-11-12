@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v0.4.0 启动图标前景：2x2 拼屏网格（暖白三块＋右上琥珀金一块），居中于安全区 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 左上：暖白 -->
+    <path
+        android:fillColor="#F5F2EA"
+        android:pathData="M36,31h11a5,5 0 0 1 5,5v11a5,5 0 0 1 -5,5h-11a5,5 0 0 1 -5,-5v-11a5,5 0 0 1 5,-5z" />
+    <!-- 右上：琥珀金 -->
+    <path
+        android:fillColor="#FFC24B"
+        android:pathData="M61,31h11a5,5 0 0 1 5,5v11a5,5 0 0 1 -5,5h-11a5,5 0 0 1 -5,-5v-11a5,5 0 0 1 5,-5z" />
+    <!-- 左下：暖白 -->
+    <path
+        android:fillColor="#F5F2EA"
+        android:pathData="M36,56h11a5,5 0 0 1 5,5v11a5,5 0 0 1 -5,5h-11a5,5 0 0 1 -5,-5v-11a5,5 0 0 1 5,-5z" />
+    <!-- 右下：暖白 -->
+    <path
+        android:fillColor="#F5F2EA"
+        android:pathData="M61,56h11a5,5 0 0 1 5,5v11a5,5 0 0 1 -5,5h-11a5,5 0 0 1 -5,-5v-11a5,5 0 0 1 5,-5z" />
+</vector>
