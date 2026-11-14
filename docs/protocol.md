@@ -161,3 +161,43 @@
 
 - **`PREPARE.url` 可为 B 站解析后的 CDN 地址**：主机在「链接」入口收到 B 站形态输入（b23.tv 短链接、`bilibili.com/video/BV…` 链接、裸 BV 号、混有上述链接的 App 分享文本）时，先在主机本地完成解析（免登录、无 Cookie，桌面 UA＋Referer 调 `x/web-interface/view` 取 cid 与标题，再调 `x/player/playurl`（qn=80、fnval=1）取单文件 mp4 地址），随后与普通直链同路：主机本机以该地址备片，`PREPARE.url` 原样下发该 CDN 地址，从机以既有直链流式路径直接从 B 站 CDN 拉流播放。解析任一步失败，主机只在状态栏与日志报失败阶段（`BILI resolve fail stage=<redirect|view|playurl> code=<原始 code 或 http 状态>`），不发 PREPARE、不自动重试（上限 1 次，本版实现为 0 次）。成功记日志 `BILI resolve ok title=<标题> quality=<playurl 返回的 quality 数值> chost=<播放地址 host>`。解析所得地址随 B 站签名时效过期，口径与既有直链一致：建会解析、立即使用、不缓存。
 - **播放侧请求头规则**：任一端（含主机本地备片）以 media3 播放时，若流地址的 host 含 `bilivideo` 或含 `upos`，数据源必须附加 `Referer: https://www.bilibili.com` 与桌面 Chrome UA（与解析侧同一 UA）——B 站 CDN 无此 Referer 回 403（实测：无 Referer 403、带 Referer 206）。其他来源地址（主机分发、普通直链、本地文件）不得附加这两个头。
+
+## 18. v1.11 增补（v0.7.1 实现）
+
+本节为 v0.7.1 的增补：主机进度条拖动触发的位置跳变改为主机发起的协同定点重起播（废止旧 `SEEK` 即 seek 即播机制——主机侧不再发送 `SEEK`；从机侧 `SEEK` 接收分支保留，混用旧版主机时仍可工作）。只增补，其余各节不变。
+
+- **新增消息（四种，走既有 WebSocket 通道）**：
+  - `SEEK_SCHED{ pos_ms, floor_at, cap_at, was_playing }`（HOST → 全体广播）：`pos_ms` 为目标位置毫秒；`floor_at` 为主机时钟毫秒（最早恢复时刻）；`cap_at` 为主机时钟毫秒（最迟决策时刻）；`was_playing` 为布尔（拖动开始前是否处于播放状态）。
+  - `SEEK_READY{ client_no, ready_ms }`（CLIENT → HOST）：`client_no` 为回报从机编号；`ready_ms` 为该从机从收到 SEEK_SCHED 到判定就绪的耗时毫秒。
+  - `SEEK_FAIL{ client_no, reason }`（CLIENT → HOST）：`client_no` 为回报从机编号；`reason` 为失败原文。
+  - `RESUME_AT{ start_at, play }`（HOST → 全体广播）：`start_at` 为主机时钟毫秒（play 为 true 时全体在该时刻开始播放）；`play` 为布尔。
+- **主机流程**：拖动开始（SeekBar 的 onStartTrackingTouch）时，主机先快照 was_playing，再走既有 PAUSE 广播，全体暂停在当前位置。拖动结束（onStopTrackingTouch）时，主机计算 floor_at = 主机当前时钟 + 600ms、cap_at = 主机当前时钟 + 1200ms，广播 SEEK_SCHED；主机本机立即执行从机流程（见下条），就绪以 client_no=0 计入收集集合。主机收集 SEEK_READY 与 SEEK_FAIL：已连接从机全部回报（READY 或 FAIL）且时刻达到 floor_at 时发出 RESUME_AT，start_at 定为 floor_at；已连接从机在 floor_at 之后、cap_at 之前才全部回报时，start_at 定为最后回报时刻 + 200ms；cap_at 到达时仍有从机未回报，start_at 定为 cap_at + 200ms，未回报的从机按迟到处理。was_playing 为 false 时，主机在全员回报或 cap_at 到达时发出 RESUME_AT，play 定为 false，全体停在 pos_ms 保持暂停。收集期间从机断开连接时，主机把该从机移出收集集合（收集集合只统计当前已连接的从机）。窗口取值依据：固定 2 秒用户可感（Owen 定版口径），故最早恢复压到 600ms、最迟决策 1200ms，典型全程冻结 600–1000ms。
+- **从机流程**：从机收到 SEEK_SCHED 后立即在暂停态 seek 到 pos_ms，seek 落点参数使用 media3 的 SeekParameters.EXACT。就绪判定为两个条件同时成立：条件一 seek 处理完成（media3 1.4.1 无 onSeekProcessed 回调，以 `onPositionDiscontinuity` 的 `DISCONTINUITY_REASON_SEEK` 位置跳变信号为等价信号）；条件二 bufferedPosition ≥ pos_ms + 1000ms。两条件成立时从机发 SEEK_READY。seek 报错时从机发 SEEK_FAIL；收到 SEEK_SCHED 后 3000ms 仍未就绪时从机发 SEEK_FAIL，reason 写明超时。从机收到 RESUME_AT 且 play 为 true 时，在 start_at 对应的本地时刻执行播放（本地时刻换算使用既有对时 offset）；play 为 false 时停在 pos_ms 保持暂停。迟到从机指在 start_at 之后才就绪的从机：迟到从机就绪后立即播放，日志中标 late=true；迟到从机的偏差由收敛模式处理。
+- **收敛模式**：收敛期为 RESUME_AT 执行后的 10 秒。收敛期内 TICK 间隔为 1000ms（主机侧判定：协同 seek 收集期／RESUME_AT 待执行／收敛期内均发 1000ms TICK，其余 5000ms）。收敛期内纠偏只使用速率微调，速率公式与钳位与现行口径相同（adj = clamp(−err/10000, −0.05, +0.05)，死区 |err| ≤ 30ms）；收敛期内的唯一 seek 例外：|err| > 2000ms 时允许 seek 纠偏一次，冷却 8 秒。连续两次 TICK 的 |err| 均 ≤ 50ms 时收敛期提前结束；收敛期结束或提前结束时，TICK 间隔恢复 5000ms，其余口径恢复现行值。
+- **缓冲门槛**：播放器 LoadControl 的 bufferForPlaybackAfterRebufferMs 定为 1000（media3 默认 5000），构建 DefaultLoadControl 时设置；其余缓冲参数保持 media3 默认值。**该门槛全局生效**：本机所有播放路径共用同一播放器构建入口，普通卡顿恢复同样适用——卡后攒够 1 秒缓冲即恢复播放（恢复更快），代价是弱网下缓冲垫变薄、刚恢复即再卡的概率上升。
+- **日志（标签沿用 DUOPING，日志文件路径不变）**：从机每次协同 seek 就绪时打一行 `SEEKCOORD ready client=<no> pos=<pos_ms> ready_ms=<耗时毫秒> late=<true|false>`；从机每次发 SEEK_FAIL 时打一行 `SEEKCOORD fail client=<no> pos=<pos_ms> reason=<失败原文>`；主机每次发出 RESUME_AT 时打一行 `SEEKCOORD resume start_after_ms=<从广播 SEEK_SCHED 到 start_at 的毫秒数> ready_n=<就绪数> fail_n=<失败数> pending_n=<未回报数>`。
+
+
+## 19. v1.12 增补（v0.7.2 实现）
+
+本节为 v0.7.2 的增补：协同 seek 常量校准、主机决策定时的可靠性修复与日志 path 字段、抖音分享链接解析。协议不新增消息，其余各节不变（§18 的消息与流程继续有效，下文只记变更点）。
+
+- **常量校准**：SEEK_SCHED 窗口与 RESUME_AT 前置量变更——floor_at = 广播时刻 + 500ms（v1.11 为 600ms）；cap_at = 广播时刻 + 1200ms（不变）；floor 之后回报齐或 cap 决策时 start_at 的前置量为 100ms（v1.11 为 200ms）。依据：2026-11-14 B 站三机实测就绪分布（15 次 157–718ms、中位 372ms；三次下限绑定拖动最慢就绪 461/459/271ms 均 <500ms；最慢 718ms 证明 cap 余量仍需保留）。
+- **决策定时可靠性修复（行为规则不变）**：v1.11 实现的主机决策定时是 floor/cap 两点单点检查，回报路径在「已齐但未到 floor」时不自行发出、依赖 floor 单点检查；该单点失效时决策会被拖到 cap（2026-11-14 实测一例：三方已于 floor 前收齐，RESUME_AT 仍走 cap、start_after_ms=1400）。v1.12 改为持续复查的决策循环（每 25ms 复查收集状态，cap 到达强制决策）。start_at 三分支的规则与公式不变：全员回报且决策时刻 ≤floor_at → start_at = floor_at；floor 后 cap 前回报齐 → start_at = 最后回报时刻 + 100ms；cap 仍未齐 → start_at = cap_at + 100ms。暂停拖动（was_playing=false）与播放中拖动共用同一套决策规则。
+- **日志 path 字段**：主机发出 RESUME_AT 的日志行新增字段 path（其余字段同 §18）：`SEEKCOORD resume start_after_ms=<毫秒数> ready_n=<就绪数> fail_n=<失败数> pending_n=<未回报数> path=<floor|last|cap>`。path 与 start_at 分支一一对应：floor＝全员在 floor_at 前回报、start_at 定为 floor_at；last＝floor_at 后、cap_at 前收齐、start_at 定为最后回报时刻 +100ms；cap＝cap_at 到达时发出、start_at 定为 cap_at +100ms。
+- **抖音分享链接解析（主机本地行为，不新增消息）**：PREPARE.url 的取值来源再扩展——主机在「链接」入口收到抖音形态输入（v.douyin.com 短链、iesdouyin.com 分享链接、www.douyin.com/video 完整链接，含混有上述链接的整段分享文本）时，先在主机本地解析：第一步只用普通 HTTP 跟随重定向，从最终地址提取作品 id（`/video/<id>`）；第二步主机内置 WebView 加载分享页（开启 JavaScript、移动端 UA），由抖音页面自身脚本完成签名请求后两路捕获、先得者为准——甲路拦截页面发出的媒体请求（host 含 douyinvod 或 URL 含 .mp4），乙路读页面 video 元素的 currentSrc。总时限 20 秒，超时或失败主机只报解析失败（日志 `DOUYIN resolve fail stage=<redirect|webview> code=<…>`），不发 PREPARE、不阻塞其他入口。捕获成功后立即停止加载并销毁 WebView（WebView 只在解析期间存在，不进入播放期）；解析所得媒体地址与 B 站解析同路，写入 PREPARE.url 原样下发。纯 HTTP 接口路线（分享页 SSR 数据、旧 iteminfo 接口、无签名 web detail 接口）已经实测排除，不得改走。
+- **抖音播放侧请求头规则**：任一端以 media3 播放时，若流地址的 host 含 douyinvod，数据源必须附加 `Referer: https://www.douyin.com/` 与解析一致的移动端 UA（与 §17 的 bilivideo/upos 规则同构）。其他来源地址不得附加这两个头。
+- **真机验收声明**：抖音解析依赖主机真机 WebView 与真实网络环境，沙箱无法验收；本节流程为实现口径，实际可用性以 Owen 真机验收为准。
+
+
+## 20. v1.13 增补（v0.7.3 实现）
+
+本节为 v0.7.3 的增补：远跳 seek 主机兜底（决策延期与 park、就绪判定超时放宽、日志 hold_ms 字段）、抖音纯数字 ID 输入形态、抖音 WebView 捕获增强与诊断日志。协议不新增消息，RESUME_AT 等既有消息字段不变；§18–§19 继续有效，下文只记变更点。
+
+- **就绪判定超时放宽**：§18 从机流程的就绪判定超时由 3000ms 改为 **6000ms**（收到 SEEK_SCHED 后 6000ms 仍未就绪才发 SEEK_FAIL，reason 为 seek_coord_timeout）。该时限为主机本机与从机共用的同一常量（主机本机以 client_no=0 同路执行从机流程）。依据：远跳 seek（如约 25 分钟长视频拖到 24 分处）的缓冲长尾超过 3000ms，v0.7.2 实测主机自身即因此误判失败。
+- **决策延期（仅 was_playing=true 适用）**：cap_at 到达时，若主机自身 seek 仍在进行中（主机未回报 READY、亦未回报 FAIL），主机推迟发出 RESUME_AT，进入推迟期；推迟上限 = SEEK_SCHED 发出时刻 + 3000ms。推迟期内主机先就绪时，主机立即发出 RESUME_AT：start_at = 主机就绪时刻 + 100ms（lead 不变），play = was_playing（即 true），日志 path=last；推迟期内主机 seek 失败（FAIL 已登记）时，推迟前提消失，主机按 cap 语义立即发出（play = was_playing）。was_playing=false 的拖动不适用本条，行为与 §19 一致。
+- **park（推迟到上限仍未就绪）**：推迟到上限主机仍未就绪时，主机发出 RESUME_AT 且 **play 定为 false**，全员停在 pos_ms 保持暂停；发出前主机打一行日志 `SEEKCOORD park reason=host_not_ready`。
+- **日志 hold_ms 字段**：主机发出 RESUME_AT 的日志行在 path 之后新增 hold_ms：`SEEKCOORD resume start_after_ms=<毫秒数> ready_n=<就绪数> fail_n=<失败数> pending_n=<未回报数> path=<floor|last|cap> hold_ms=<毫秒数>`。hold_ms = 决策在 cap_at 之后推迟的毫秒数（发出时刻 − cap_at）；未进入推迟期的发出 hold_ms=0。
+- **抖音纯数字 ID 形态（主机本地行为，不新增消息）**：§19 的抖音输入形态增补第五种——输入去除首尾空白后为纯数字、长度 10 至 25 位时，判定为抖音作品 ID：跳过第一步（重定向与 ID 提取），直接进入第二步 WebView 捕获，加载地址为 `https://www.iesdouyin.com/share/video/<作品ID>/`。纯数字 ID 不得按直链处理。其余四种形态与第一步、第二步流程不变。
+- **抖音 WebView 捕获增强（主机本地行为）**：第二步捕获期间，主机每 500ms 以 JavaScript 读取一次页面状态（video 元素是否存在、readyState、currentSrc 的域名、document.title、当前页面地址的域名）；轮询中 video 元素 currentSrc 出现 http 媒体地址时按乙路（videosrc）完成捕获。页面加载完成（onPageFinished）后仍未捕获时，依次动用两手增强（各一次）：甲手将 video 元素设为静音并调用 play()；乙手对 video 元素派发一次 click 事件。总时限仍为 20 秒。
+- **抖音诊断日志**：第二步解析结束时（捕获成功或超时），主机打一行 `DOUYIN page via=<request|videosrc|none> hasVideo=<0|1|-> readyState=<数值|-> srchost=<域名|-> title=<页面标题|-> pagehost=<域名|->`，via 为命中的捕获路（超时为 none），其余字段为最后一次状态读取的取值（从未读到时以 `-` 占位）。§19 的 `DOUYIN capture via=request/videosrc` 两行保留不变。

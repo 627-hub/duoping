@@ -18,6 +18,12 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
 import android.view.TextureView
+import android.view.ViewGroup
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
@@ -32,21 +38,28 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.PorterDuff
 import android.hardware.Camera
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.MotionEvent
 import android.widget.ImageView
+import android.widget.ProgressBar
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.java_websocket.WebSocket
 import org.java_websocket.client.WebSocketClient
 import org.java_websocket.handshake.ClientHandshake
@@ -197,6 +210,47 @@ class MainActivity : Activity() {
     // ---- v0.3.3：校正改速率微调（死区 30ms／微调区 30–2000ms／seek 仅灾难偏差） ----
     @Volatile private var appliedRate: Float = 1.0f // 从机当前实际下发到播放器的速率（会话速率×微调系数）；主机为参考不使用
 
+    // ---- v0.7.1：协同 seek（自适应窗口定点重起播，协议 §18 v1.11 增补）＋ 收敛模式 ----
+    private val SEEK_FLOOR_MS = 500L // SEEK_SCHED 窗口下限：最早恢复时刻 = 广播时刻 +500ms（v0.7.2 校准 600→500：B 站三机实测三次下限绑定拖动最慢就绪 461/459/271 均 <500；再降到 400 会让慢就绪改走 last 路径反而更慢）
+    private val SEEK_CAP_MS = 1200L // SEEK_SCHED 窗口上限：最迟决策时刻 = 广播时刻 +1200ms（v0.7.2 保持不变：实测最慢就绪 718，流媒体长尾真实存在）
+    private val SEEK_LEAD_MS = 100L // floor 后全员回报／cap 决策时 start_at 的前置量（v0.7.2 校准 200→100）
+    private val SEEK_READY_TIMEOUT_MS = 6000L // 收到 SEEK_SCHED 后未就绪判 FAIL 的时限（v0.7.3 由 3000 改 6000：远跳 seek 缓冲长尾；主机与从机共用同一常量）
+    private val SEEK_HOST_HOLD_MAX_MS = 3000L // v0.7.3 决策延期上限：cap 后主机自身 seek 未终局时，RESUME_AT 最多推迟到 SEEK_SCHED 发出后 3000ms（仅 was_playing=true 适用）
+    private val CONV_WINDOW_MS = 10000L // 收敛期时长（RESUME_AT 执行后 10 秒）
+    private val CONV_TICK_MS = 1000L // 收敛期内主机 TICK 间隔
+    private val BUFFER_AFTER_REBUFFER_MS = 1000 // LoadControl 卡顿恢复再播缓冲门槛（全局生效）
+    // 执行端状态（任一设备走从机流程时使用；主机本机以 client_no=0 同路参与）
+    @Volatile private var coordSeekActive: Boolean = false // 本轮协同 seek 进行中（待就绪/待恢复）
+    @Volatile private var coordPosMs: Long = 0
+    @Volatile private var coordRecvMs: Long = 0 // 收到 SEEK_SCHED 的本机时刻（ready_ms 计时起点）
+    @Volatile private var coordSeekProcessed: Boolean = false // 就绪条件一：onSeekProcessed 已到
+    @Volatile private var coordReadySent: Boolean = false // 本轮就绪已判定（主机端即记入收集表）
+    @Volatile private var coordPlayPending: Boolean? = null // RESUME_AT 待执行：true=待起播，false=已按暂停收尾，null=无
+    @Volatile private var coordPlayLaunched: Boolean = false // RESUME_AT 起播协程已排定（防重复执行）
+    @Volatile private var coordStartAtHostMs: Long = 0 // RESUME_AT 的 start_at（主机时钟）
+    private var coordPollJob: Job? = null
+    private var coordTimeoutJob: Job? = null
+    // 主机收集端状态
+    @Volatile private var dragWasPlaying: Boolean = false // 本次拖动开始前是否处于播放状态（onStartTrackingTouch 时刻快照）
+    @Volatile private var seekSchedActive: Boolean = false
+    private val seekReplies = ConcurrentHashMap<Int, String>() // 收集表：no -> "READY"|"FAIL"（主机本机记 0）
+    @Volatile private var seekSchedPosMs: Long = 0
+    @Volatile private var seekSchedAtMs: Long = 0 // 广播 SEEK_SCHED 的主机时刻（start_after_ms 计时起点）
+    @Volatile private var seekFloorAtMs: Long = 0
+    @Volatile private var seekCapAtMs: Long = 0
+    @Volatile private var seekWasPlaying: Boolean = false
+    @Volatile private var seekResumeSent: Boolean = false
+    private var seekTimerJob: Job? = null
+    @Volatile private var seekHoldUntilMs: Long = 0 // v0.7.3 决策延期截止（主机时钟）：cap 时主机自身 seek 未终局而进入推迟期时置位；0=未进入推迟期
+    // ---- v0.7.4：等待转圈（舞台中央非交互层）——协同 seek 未决（reason=seek）或播放意图下缓冲中（reason=buffer）时显示 ----
+    private var spinBox: LinearLayout? = null // 转圈容器（圆形转圈＋「加载中…」），buildStage 时建
+    @Volatile private var spinSeekPending = false // 协同 seek 未决：startCoordSeek 置位，RESUME_AT 实际执行清零
+    @Volatile private var spinBuffering = false // 播放器当前处于 STATE_BUFFERING（监听回调维护）
+    private var spinShown = false // 转圈当前是否可见（SPIN show/hide 日志只在切换时各打一行）
+    // 收敛模式（执行端；主机同时用 convUntilMs 决定 TICK 快 cadence）
+    @Volatile private var convUntilMs: Long = 0 // 收敛期截止（本机时钟）；0=不在收敛期
+    @Volatile private var convGoodTicks: Int = 0 // 连续 |err|<=50ms 的 TICK 计数（提前结束判定）
+
     // ---- v0.5.0：局域网文件互传（一次性、多选、SHA-256 校验、.part 断点续传；仅主机⇄从机） ----
     private class XferItem(val name: String, var size: Long, var sha256: String, val uri: Uri?)
     // 发送方状态
@@ -251,7 +305,7 @@ class MainActivity : Activity() {
     @Volatile private var chromeReasonHint: String? = null // 本次切换的原因提示（cmd/tap/timeout，apply 时消费）
     private var panelBtn: Button? = null // 工具条「面板」按钮：播放期进整页面板的唯一显式入口
     private var stopBtn: Button? = null // v0.6.3：工具条「退出播放」按钮（STOP 发起入口，仅主机；显隐随会话状态）
-    private var stopPageBtn: Button? = null // v0.6.3：面板「播放」页「退出播放」按钮（与工具条同一处理函数）
+    private var stopPageBtn: Button? = null // v0.6.3：面板「视频」页「退出播放」按钮（原「播放」页，v0.7.4 改名；与工具条同一处理函数）
     private var clientExitBox: LinearLayout? = null // 从机播放期极简退出条（舞台底部，只一颗「退出播放」）
     private var clientBarHideJob: Job? = null
     @Volatile private var clientBarVisibleNow: Boolean = false
@@ -661,7 +715,68 @@ class MainActivity : Activity() {
         }
         clientExitBox = exitBox
         stage.addView(exitBox)
+        // v0.7.4：等待转圈——舞台中央非交互层（容器与子视图均不可点击不抢焦点，点按穿透到舞台/退出条/控制条），
+        // 默认隐藏，显隐由 updateSpin 按协同 seek 未决／缓冲状态统一驱动（主机从机同体，见 updateSpin）
+        val sBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            isClickable = false
+            isFocusable = false
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            )
+            visibility = View.GONE
+        }
+        sBox.addView(ProgressBar(this).apply {
+            isIndeterminate = true
+            isClickable = false
+            isFocusable = false
+            indeterminateDrawable?.setColorFilter(colGold, PorterDuff.Mode.SRC_IN)
+            layoutParams = LinearLayout.LayoutParams(dp(48), dp(48)).apply { gravity = Gravity.CENTER_HORIZONTAL }
+        })
+        sBox.addView(TextView(this).apply {
+            text = "加载中…"; textSize = 14f; setTextColor(colText); gravity = Gravity.CENTER
+            isClickable = false
+            isFocusable = false
+            layoutParams = stackLp(8)
+        })
+        spinBox = sBox
+        stage.addView(sBox)
         setContentView(stage)
+    }
+
+    /**
+     * v0.7.4：等待转圈显隐统一出口（状态重算式，任何状态变化点调用即收敛）：
+     * 显示条件（其一）——协同 seek 未决（spinSeekPending：主机自 SEEK_SCHED 发出、从机自收到起，至 RESUME_AT 实际执行止，
+     * 含主机 hold 推迟期），reason=seek；播放器 STATE_BUFFERING 且本机意图为播放（已起播、非用户暂停、未自然播完），reason=buffer。
+     * 隐藏——两条件均不成立（RESUME_AT 已执行且退出缓冲／用户暂停／STOP／EXIT_PLAYBACK／断线／自然播完均经状态清零或重算收敛）。
+     * 切换时各打一行 SPIN show reason=<seek|buffer>／SPIN hide；不重复打行。
+     */
+    private fun updateSpin() {
+        val wantSeek = spinSeekPending
+        val wantBuffer = spinBuffering && started && !localPaused && !playbackEnded
+        val want = wantSeek || wantBuffer
+        val reason = if (wantSeek) "seek" else "buffer"
+        runOnUiThread {
+            val box = spinBox ?: return@runOnUiThread
+            if (want && !spinShown) {
+                spinShown = true
+                box.visibility = View.VISIBLE
+                klog("SPIN show reason=$reason")
+            } else if (!want && spinShown) {
+                spinShown = false
+                box.visibility = View.GONE
+                klog("SPIN hide")
+            }
+        }
+    }
+
+    /** v0.7.4：转圈状态复位（STOP／从机退出播放／断线／结束会话等离开播放的统一清理）：清两标志后重算收敛隐藏。 */
+    private fun spinReset() {
+        spinSeekPending = false
+        spinBuffering = false
+        updateSpin()
     }
 
     private fun buildRolePickerUi() {
@@ -858,6 +973,7 @@ class MainActivity : Activity() {
      */
     private fun exitClientPlayback() {
         if (role != "client") return
+        spinReset() // v0.7.4：EXIT_PLAYBACK（本机退出）——转圈复位隐藏
         hideClientBar()
         try { wsClient?.send(msg("EXIT_PLAYBACK").put("client_no", myNo).toString()) } catch (e: Exception) {}
         releasePlayWakeLock("client exit playback")
@@ -952,7 +1068,10 @@ class MainActivity : Activity() {
             text = "服务端启动中…"; textSize = 15f; setTextColor(colText)
             layoutParams = stackLp(10)
         }
-        // ---- v0.6.0：主机覆盖层分页（播放／布局／互传／更多）——只动视图组织：既有控件、回调、文案、日志一律保留，仅改挂载父容器 ----
+        // ---- v0.6.0：主机覆盖层分页——只动视图组织：既有控件、回调、文案、日志一律保留，仅改挂载父容器 ----
+        // v0.7.4 分页重组（Owen 2026-11-14 裁定）：四页（播放／布局／互传／更多）改三页（视频／连接／更多）——
+        // 视频页 = 原播放页选片与准备 + 原布局页全部；连接页 = 二维码 + 服务端状态 + 设备表 + 原互传页全部；更多页不变
+        // v0.7.5 微调（Owen 2026-11-14）：页序改连接／视频／更多、面板默认停连接页；视频页功能组间距加大；状态行自连接页移回视频页准备组之后
         modePillBtns.clear() // 旧布局胶囊行退役（布局改走布局页图示卡片），清旧引用防跨会话残留
         hostPageBoxes.clear(); hostTabBtns.clear()
         val tabRow = LinearLayout(this).apply {
@@ -963,17 +1082,17 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             layoutParams = stackLp()
         }
-        listOf("play" to "播放", "layout" to "布局", "xfer" to "互传", "more" to "更多").forEach { (key, label) ->
+        listOf("conn" to "连接", "play" to "视频", "more" to "更多").forEach { (key, label) ->
             val page = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                visibility = if (key == "play") View.VISIBLE else View.GONE
+                visibility = if (key == "conn") View.VISIBLE else View.GONE
                 layoutParams = stackLp()
             }
             hostPageBoxes[key] = page
             pagesBox.addView(page)
             val tb = Button(this).apply {
                 text = label
-                styleModePill(this, key == "play")
+                styleModePill(this, key == "conn")
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                     .apply { leftMargin = dp(3); rightMargin = dp(3) }
                 setOnClickListener { selectHostPage(key) }
@@ -984,13 +1103,12 @@ class MainActivity : Activity() {
         controlsCol.addView(tabRow)
         controlsCol.addView(pagesBox)
         val playPage = hostPageBoxes["play"]!!
-        val layoutPage = hostPageBoxes["layout"]!!
-        val xferPage = hostPageBoxes["xfer"]!!
+        val connPage = hostPageBoxes["conn"]!!
         val morePage = hostPageBoxes["more"]!!
-        // —— 播放页：选片／分发入口、起播、就绪状态列表概要（设备表）、状态行 ——
+        // —— 视频页：选片／链接／准备（原播放页）＋布局全部（原布局页并入，见本页后半）——
         playPage.addView(pickButton())
         // 改动六入口乙：直链输入——粘贴 http/https 直链成为本场媒体地址（入口甲为上方本地选片）
-        val linkInput = EditText(this).apply { hint = "粘贴 B 站分享链接，或 http/https 直链"; styleInput(this); layoutParams = stackLp(12) }
+        val linkInput = EditText(this).apply { hint = "粘贴 B 站 / 抖音分享链接、纯数字 ID，或 http/https 直链"; styleInput(this); layoutParams = stackLp(24) }
         playPage.addView(linkInput)
         playPage.addView(Button(this).apply {
             text = "用此链接"
@@ -1001,7 +1119,7 @@ class MainActivity : Activity() {
         playPage.addView(Button(this).apply {
             text = "准备 (PREPARE → 等 READY 后自动起播)"
             stylePrimaryButton(this)
-            layoutParams = stackLp(14)
+            layoutParams = stackLp(24)
             setOnClickListener { hostPrepare() }
         })
         playPage.addView(Button(this).apply {
@@ -1010,6 +1128,9 @@ class MainActivity : Activity() {
             layoutParams = stackLp(10)
             setOnClickListener { hostResendPrepare() }
         })
+        // v0.7.5：主机状态行归位——v0.7.4 分页重组时随「服务端状态」误入连接页，Owen 裁定移回视频页、置于准备组之后
+        // （「已退出当前视频（组会保留），重新选片后点「准备」即可再播」等全部主机状态在此行显示，与选片/准备同页）
+        playPage.addView(statusTv)
         // v0.6.3：「退出播放」——与工具条同名按钮、同一处理函数（STOP 结束当前视频，组会保留）；无播放会话时不出现（显隐由 applyChrome 随会话状态同步）
         stopPageBtn = Button(this).apply {
             text = "退出播放"
@@ -1019,7 +1140,8 @@ class MainActivity : Activity() {
             setOnClickListener { hostStopPlayback() }
         }
         playPage.addView(stopPageBtn!!)
-        // —— v0.6.0 扫码连接（主机出码）：内容为纯文本 duoping://<局域网IP>:18765/<会话令牌>，令牌沿用本场组会随机令牌；
+        // —— 连接页：扫码连接、设备表、文件互传（v0.7.4 自原播放页/互传页并入；状态行 v0.7.5 已移回视频页）——
+        // v0.6.0 扫码连接（主机出码）：内容为纯文本 duoping://<局域网IP>:18765/<会话令牌>，令牌沿用本场组会随机令牌；
         // 码下同时显示 IP 与令牌文本，扫不了时从机手输 IP 的兜底不变 ——
         val qrText = "duoping://$ip:$PORT/$mediaToken"
         val qrImg = ImageView(this).apply {
@@ -1037,7 +1159,7 @@ class MainActivity : Activity() {
             textSize = 13f; setTextColor(colSub); gravity = Gravity.CENTER
             layoutParams = stackLp(8)
         })
-        playPage.addView(Button(this).apply {
+        connPage.addView(Button(this).apply {
             text = "显示连接二维码"
             styleGhostButton(this)
             layoutParams = stackLp(14)
@@ -1050,19 +1172,18 @@ class MainActivity : Activity() {
                 }
             }
         })
-        playPage.addView(qrBox)
+        connPage.addView(qrBox)
         devicesHeaderTv = TextView(this).apply {
             text = "设备表: （暂无）"; textSize = 13f; setTextColor(colSub)
             layoutParams = stackLp(18)
         }
-        playPage.addView(devicesHeaderTv)
+        connPage.addView(devicesHeaderTv)
         devicesBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        playPage.addView(devicesBox)
-        playPage.addView(statusTv)
-        // —— 布局页：显示模式二选一（全场 fit）＋布局图示卡片 ——
-        layoutPage.addView(TextView(this).apply {
+        connPage.addView(devicesBox)
+        // —— 视频页后半：布局（原布局页全部）——显示模式（全场 fit）＋布局图示卡片 ——
+        playPage.addView(TextView(this).apply {
             text = "显示模式（全场，选定即下发）"; textSize = 13f; setTextColor(colSub)
-            layoutParams = stackLp(4)
+            layoutParams = stackLp(24)
         })
         val fitRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1090,23 +1211,23 @@ class MainActivity : Activity() {
         fitRow.addView(fitCoverBtn!!)
         fitRow.addView(fitContainBtn!!)
         fitRow.addView(fitContainVBtn!!)
-        layoutPage.addView(fitRow)
+        playPage.addView(fitRow)
         // v0.6.1：显示模式说明行——如实标注每档代价（cover 明示「铺满会裁切画面」，不拿完整话术描述铺满）
         fitHintTv = TextView(this).apply {
             textSize = 12f; setTextColor(colSub)
             layoutParams = stackLp(6)
         }
-        layoutPage.addView(fitHintTv!!)
+        playPage.addView(fitHintTv!!)
         refreshFitPills()
-        layoutPage.addView(TextView(this).apply {
+        playPage.addView(TextView(this).apply {
             text = "布局排布（按各机物理尺寸成比例绘制，点卡片即下发）"; textSize = 13f; setTextColor(colSub)
             layoutParams = stackLp(14)
         })
         layoutCardsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        layoutPage.addView(layoutCardsBox!!)
+        playPage.addView(layoutCardsBox!!)
         rebuildLayoutCards()
-        // —— 互传页 ——
-        buildXferSection(xferPage) // v0.5.0：文件互传区（主机页；v0.6.0 起挂互传分页）
+        // —— 连接页后半：文件互传全部控件（原互传页并入）——
+        buildXferSection(connPage) // v0.5.0：文件互传区（主机页；v0.6.0 起挂互传分页，v0.7.4 起挂连接页）
         // —— 更多页：全场亮度（自常显控制条移入，广播语义不变）、本机色温、调试说明、结束会话 ——
         morePage.addView(TextView(this).apply {
             text = "全场亮度（拖动结束应用本机并广播全场）"; textSize = 13f; setTextColor(colSub)
@@ -1411,10 +1532,16 @@ class MainActivity : Activity() {
                         timeTv?.text = "${fmtTime(progress.toLong())} / ${fmtTime(dur)}"
                     }
                 }
-                override fun onStartTrackingTouch(sb: SeekBar?) { seekDragging = true }
+                override fun onStartTrackingTouch(sb: SeekBar?) {
+                    seekDragging = true
+                    // v0.7.1 主机流程 1：拖动开始先快照 was_playing，再走既有 PAUSE 广播全体暂停在当前位置
+                    dragWasPlaying = started && !localPaused
+                    if (started && !localPaused) hostPause()
+                }
                 override fun onStopTrackingTouch(sb: SeekBar?) {
                     seekDragging = false
-                    hostSeek((sb?.progress ?: 0).toLong())
+                    // v0.7.1：拖动结束改走协同定点重起播（废止旧 SEEK 即 seek 即播，见 hostSeekCoord）
+                    hostSeekCoord((sb?.progress ?: 0).toLong(), dragWasPlaying)
                 }
             })
         }
@@ -1459,6 +1586,7 @@ class MainActivity : Activity() {
         playPauseBtn?.text = "继续"
         chromeHideJob?.cancel() // v0.6.1：暂停钉住 CHROME 常显，停自隐计时（applyChrome 按 pause 规则点亮/保持）
         applyChrome()
+        updateSpin() // v0.7.4：用户暂停——buffer 条件失效，转圈重算（seek 未决不受影响）
         releasePlayWakeLock("host pause")
         setStatus("已暂停于 ${fmtTime(pos)}")
     }
@@ -1476,14 +1604,289 @@ class MainActivity : Activity() {
         setStatus("全场将于 1.2 秒后继续播放")
     }
 
-    private fun hostSeek(pos: Long) {
-        val p = player ?: return
+    /**
+     * v0.7.1 主机流程（协议 §18）：拖动结束不再走旧 SEEK（各机即 seek 即播、落点差直接变偏差），
+     * 改为协同定点重起播——广播 SEEK_SCHED 开一个自适应窗口，收集全场就绪回报后以 RESUME_AT 定点齐播。
+     * v0.7.2 常量校准（协议 §19）：floor 500ms／cap 1200ms、lead 100ms，典型全程冻结 500–900ms；
+     * 依据 2026-11-14 B 站三机实测就绪分布（15 次 157–718ms、中位 372ms）。
+     */
+    private fun hostSeekCoord(pos: Long, wasPlaying: Boolean) {
+        player ?: return
         if (!started) { setStatus("尚未起播，不能拖动进度"); return }
-        programSeek(p, pos)
-        server?.broadcast(msg("SEEK").put("media_pos_ms", pos).toString())
-        klog("SEEK sent media_pos_ms=$pos paused=$localPaused")
+        if (!localPaused) hostPause() // 兜底：拖动开始已广播 PAUSE 时 localPaused 已为 true 不重复；防 onStart 未触发的路径
+        seekWasPlaying = wasPlaying
+        seekSchedPosMs = pos
+        seekSchedActive = true
+        seekResumeSent = false
+        seekHoldUntilMs = 0
+        seekReplies.clear()
+        seekSchedAtMs = System.currentTimeMillis()
+        seekFloorAtMs = seekSchedAtMs + SEEK_FLOOR_MS
+        seekCapAtMs = seekSchedAtMs + SEEK_CAP_MS
+        server?.broadcast(msg("SEEK_SCHED").put("pos_ms", pos).put("floor_at", seekFloorAtMs)
+            .put("cap_at", seekCapAtMs).put("was_playing", wasPlaying).toString())
+        klog("SEEK_SCHED sent pos=$pos floor_at=$seekFloorAtMs cap_at=$seekCapAtMs was_playing=$wasPlaying")
+        startCoordSeek(pos, fromHost = true) // 主机流程 3：主机本机同走从机流程，就绪计入收集集合（no=0）
+        armSeekSchedTimers()
         chromeShow("cmd") // v0.6.1：命令唤醒 CHROME
-        setStatus("全场跳转到 ${fmtTime(pos)}")
+        setStatus("全场协同跳转到 ${fmtTime(pos)}")
+    }
+
+    /**
+     * 主机决策定时（v0.7.2 改为持续复查的决策循环，每 25ms 一查，cap 到达强制决策）。
+     * 怪癖根因与修法：v0.7.1 是两段式单点检查——floor 时刻查一次、未齐就只剩 cap 时刻再查一次；而回报路径的
+     * maybeSendResumeAt() 在「已齐但未到 floor」时直接返回、把决定全押在 floor 单点检查上。该单点一旦失效
+     * （检查在最后一份回报登记前一闪而过、或被主线程卡顿吞掉），本轮再无任何复查，决策一路拖到 cap。
+     * 实证：2026-11-14 B 站场次第 3 次拖动三方就绪 361/372/417ms、主机于 floor 前约 83ms 收齐两份回报，
+     * RESUME_AT 却走 cap（start_after_ms=1400）；同场次第 4 次同为暂停拖动却走 floor（600），且当晚连接集合
+     * 只有 1/2 号、无幻影编号——排除 was_playing 分支与收集集合两类嫌疑，锁定单点检查失效这一类。
+     * 决策规则与 start_at 公式一字未动：全员回报且时刻 ≤floor → start_at=floor_at（path=floor）；
+     * floor 后 cap 前回报齐 → 最后回报时刻 +lead（path=last）；cap 仍未齐 → cap_at +lead（path=cap）。
+     * v0.7.3 增补（协议 §20）：仅 was_playing=true 时，cap 时刻主机自身 seek 仍在进行中（未就绪、未失败）
+     * 则不立即发 RESUME_AT、进入推迟期（上限 = SEEK_SCHED 发出后 3000ms）：推迟期内主机就绪即按 last
+     * 公式发出（play=was_playing）、主机失败即按 cap 语义发出；到上限仍未就绪则 park（play=false 全员
+     * 停在新位置）。RESUME_AT 日志新增 hold_ms（决策在 cap 之后推迟的毫秒数，未推迟为 0）。
+     */
+    private fun armSeekSchedTimers() {
+        seekTimerJob?.cancel()
+        seekTimerJob = scope.launch {
+            while (seekSchedActive && !seekResumeSent) {
+                val now = System.currentTimeMillis()
+                if (seekHoldUntilMs > 0) {
+                    // v0.7.3 推迟期：主机就绪/失败由回报路径的 maybeSendResumeAt 即时决策；本循环只管到上限强制决策
+                    if (now >= seekHoldUntilMs) { forceResumeAtHoldExpired(); break }
+                    delay(25)
+                    continue
+                }
+                if (now >= seekCapAtMs) {
+                    maybeSendResumeAt(atCap = true)
+                    // 已发出 → while 条件收尾；进入推迟期 → 不 break，转入推迟期分支继续复查；其余情形照旧 break 防御
+                    if (seekResumeSent) break
+                    if (seekHoldUntilMs == 0L) break
+                    continue
+                }
+                val expected = clientConns.keys + 0
+                if (expected.all { seekReplies.containsKey(it) }) {
+                    if (now < seekFloorAtMs) {
+                        delay(seekFloorAtMs - System.currentTimeMillis())
+                        if (seekSchedActive && !seekResumeSent) maybeSendResumeAt(atFloor = true)
+                    } else {
+                        maybeSendResumeAt()
+                    }
+                    break
+                }
+                delay(25)
+            }
+        }
+    }
+
+    /**
+     * RESUME_AT 决策点（协议 §18 主机流程 4–8）：收集集合 = 当前已连接从机 + 主机本机（no=0），
+     * 断开者在 onClose 时已移出 clientConns、本函数按现存连接重算 pending 即自动剔除。
+     * start_at 三分支：全员回报且决策点在 floor → floor_at（日志 path=floor）；floor 后 cap 前全员回报 →
+     * 最后回报时刻 +lead（path=last）；cap 仍未齐 → cap_at +lead（path=cap）。lead 现值 100ms（v0.7.2 校准）。
+     * was_playing=false 时 play=false 全体停在 pos 保持暂停。
+     */
+    private fun maybeSendResumeAt(atFloor: Boolean = false, atCap: Boolean = false) {
+        if (!seekSchedActive || seekResumeSent) return
+        val now = System.currentTimeMillis()
+        // v0.7.3 推迟期内的回调决策（协议 §20）：主机就绪 → 按 last 公式发出（start_at=就绪时刻+lead，play=was_playing）；
+        // 主机失败 → 终局已定、推迟前提消失，按 cap 语义立即发出；主机仍在进行中、或只是从机回报 → 不发，等主机终局或上限
+        if (seekHoldUntilMs > 0) {
+            when (seekReplies[0]) {
+                "READY" -> sendResumeAt(now + SEEK_LEAD_MS, seekWasPlaying, "last", now)
+                "FAIL" -> sendResumeAt(now + SEEK_LEAD_MS, seekWasPlaying, "cap", now)
+            }
+            return
+        }
+        val expected = clientConns.keys + 0
+        val pending = expected.filter { !seekReplies.containsKey(it) }
+        if (pending.isNotEmpty() && !atCap) return
+        if (pending.isEmpty() && now < seekFloorAtMs && !atCap) return // 全员早回报：等 floor 检查点统一发（start_at=floor_at）
+        // v0.7.3 决策延期入口（仅 was_playing=true）：cap 时刻主机自身 seek 仍在进行中（未就绪、未失败）→ 进入推迟期，本次不发
+        if (atCap && seekWasPlaying && !seekReplies.containsKey(0) && now < seekSchedAtMs + SEEK_HOST_HOLD_MAX_MS) {
+            seekHoldUntilMs = seekSchedAtMs + SEEK_HOST_HOLD_MAX_MS
+            return
+        }
+        val path = when {
+            atCap -> "cap"
+            atFloor -> "floor"
+            else -> "last"
+        }
+        val startAt = when {
+            atCap -> seekCapAtMs + SEEK_LEAD_MS
+            atFloor -> seekFloorAtMs
+            else -> now + SEEK_LEAD_MS
+        }
+        sendResumeAt(startAt, seekWasPlaying, path, now)
+    }
+
+    /**
+     * RESUME_AT 实际发出（v0.7.3 抽出共用，原 maybeSendResumeAt 的发送段语义不变）：广播 + 本机执行 + 日志。
+     * 日志 hold_ms = 决策在 cap 之后推迟的毫秒数（进入过推迟期才计，未推迟为 0）。
+     * play=false 时全员停在 pos 保持暂停（含 park 情形）。
+     */
+    private fun sendResumeAt(startAt: Long, play: Boolean, path: String, now: Long) {
+        if (!seekSchedActive || seekResumeSent) return
+        seekResumeSent = true
+        seekSchedActive = false
+        seekTimerJob?.cancel()
+        val expected = clientConns.keys + 0
+        val pending = expected.filter { !seekReplies.containsKey(it) }
+        val readyN = seekReplies.values.count { it == "READY" }
+        val failN = seekReplies.values.count { it == "FAIL" }
+        val holdMs = if (seekHoldUntilMs > 0) (now - seekCapAtMs).coerceAtLeast(0) else 0L
+        server?.broadcast(msg("RESUME_AT").put("start_at", startAt).put("play", play).toString())
+        klog("SEEKCOORD resume start_after_ms=${startAt - seekSchedAtMs} ready_n=$readyN fail_n=$failN pending_n=${pending.size} path=$path hold_ms=$holdMs")
+        applyResumeAtLocal(startAt, play)
+        if (!play) setStatus("全场已定位到 ${fmtTime(seekSchedPosMs)}（保持暂停）")
+    }
+
+    /**
+     * v0.7.3 推迟到上限的强制决策（协议 §20）：主机已就绪 → 按 last 公式发出（play=was_playing）；
+     * 主机仍未就绪 → park：RESUME_AT 的 play 定为 false，全员停在新位置（暂停态），打一行 SEEKCOORD park。
+     */
+    private fun forceResumeAtHoldExpired() {
+        if (!seekSchedActive || seekResumeSent) return
+        val now = System.currentTimeMillis()
+        if (seekReplies[0] == "READY") {
+            sendResumeAt(now + SEEK_LEAD_MS, seekWasPlaying, "last", now)
+        } else {
+            klog("SEEKCOORD park reason=host_not_ready")
+            sendResumeAt(now + SEEK_LEAD_MS, false, "cap", now)
+        }
+    }
+
+    /**
+     * v0.7.1 从机流程（协议 §18，主机本机以 fromHost=true 同路执行）：暂停态以 EXACT 落点 seek 到 pos，
+     * 就绪 = seek 落点跳变信号（onPositionDiscontinuity 的 DISCONTINUITY_REASON_SEEK）已到 且 bufferedPosition >= pos+1000ms，两条件同立才判就绪；
+     * seek 报错或 6000ms 未就绪判 FAIL（v0.7.3 由 3000 改 6000）。就绪/失败的回报分流：从机发 SEEK_READY/SEEK_FAIL，
+     * 主机本机直接记入收集表并复查决策点。
+     */
+    private fun startCoordSeek(pos: Long, fromHost: Boolean) {
+        val p = player ?: return
+        cancelCoordJobs()
+        coordSeekActive = true
+        coordPosMs = pos
+        coordRecvMs = System.currentTimeMillis()
+        spinSeekPending = true // v0.7.4：协同 seek 未决——转圈显示（reason=seek），至 RESUME_AT 实际执行止
+        updateSpin()
+        coordSeekProcessed = false
+        coordReadySent = false
+        coordPlayPending = null
+        coordPlayLaunched = false
+        coordStartAtHostMs = 0
+        lastProgramSeekMs = System.currentTimeMillis() // 与 programSeek 同口径记账（RESYNC 抑制/STALL 分开计数沿用）
+        p.setSeekParameters(SeekParameters.EXACT)
+        p.seekTo(pos.coerceAtLeast(0))
+        coordPollJob = scope.launch {
+            while (coordSeekActive && !coordReadySent) {
+                val pp = player ?: break
+                if (coordSeekProcessed && pp.bufferedPosition >= coordPosMs + 1000) {
+                    onCoordReady(fromHost)
+                    break
+                }
+                delay(50)
+            }
+        }
+        coordTimeoutJob = scope.launch {
+            delay(SEEK_READY_TIMEOUT_MS)
+            if (coordSeekActive && !coordReadySent) onCoordFail(fromHost, "seek_coord_timeout")
+        }
+    }
+
+    private fun onCoordReady(fromHost: Boolean) {
+        if (!coordSeekActive || coordReadySent) return
+        coordReadySent = true
+        coordTimeoutJob?.cancel()
+        val readyMs = System.currentTimeMillis() - coordRecvMs
+        // 迟到判定：RESUME_AT 已先到且其 start_at 对应的本地时刻已过（就绪晚于定点起播时刻）
+        val late = coordPlayPending == true &&
+            System.currentTimeMillis() >= (if (fromHost) coordStartAtHostMs else coordStartAtHostMs - offsetMs)
+        klog("SEEKCOORD ready client=${if (fromHost) 0 else myNo} pos=$coordPosMs ready_ms=$readyMs late=$late")
+        if (fromHost) {
+            seekReplies[0] = "READY"
+            maybeSendResumeAt()
+        } else {
+            wsClient?.send(msg("SEEK_READY").put("client_no", myNo).put("ready_ms", readyMs).toString())
+        }
+        if (coordPlayPending == true) executeCoordPlay() // RESUME_AT 已先到：就绪即执行（迟到路径，偏差交收敛模式处理）
+    }
+
+    private fun onCoordFail(fromHost: Boolean, reason: String) {
+        if (!coordSeekActive || coordReadySent) return
+        coordSeekActive = false
+        cancelCoordJobs()
+        klog("SEEKCOORD fail client=${if (fromHost) 0 else myNo} pos=$coordPosMs reason=$reason")
+        if (fromHost) {
+            seekReplies[0] = "FAIL"
+            maybeSendResumeAt()
+        } else {
+            wsClient?.send(msg("SEEK_FAIL").put("client_no", myNo).put("reason", reason).toString())
+        }
+    }
+
+    private fun cancelCoordJobs() {
+        coordPollJob?.cancel()
+        coordTimeoutJob?.cancel()
+    }
+
+    /**
+     * RESUME_AT 本机执行（主机在广播后对本机调用、从机在收到消息时调用，两路同体）：
+     * play=false → 停在 pos 保持暂停；play=true → 已就绪者排定在 start_at（经对时 offset 换算本地时刻）起播，
+     * 未就绪者置待执行、由 onCoordReady 在就绪时补触发（迟到路径）。
+     */
+    private fun applyResumeAtLocal(startAtHostMs: Long, play: Boolean) {
+        coordStartAtHostMs = startAtHostMs
+        if (!play) {
+            coordPlayPending = false
+            coordSeekActive = false
+            cancelCoordJobs()
+            runOnUiThread {
+                player?.pause()
+                localPaused = true
+                playPauseBtn?.text = "继续"
+            }
+            spinSeekPending = false // v0.7.4：RESUME_AT 已执行（暂停收尾）——seek 未决解除
+            updateSpin()
+            klog("RESUME_AT applied play=false pos=$coordPosMs role=$role no=$myNo")
+            return
+        }
+        if (!coordSeekActive && !coordReadySent) {
+            klog("RESUME_AT play ignored (no active coord seek) role=$role no=$myNo")
+            return
+        }
+        coordPlayPending = true
+        if (coordReadySent) executeCoordPlay()
+    }
+
+    /** 定点起播执行：到 start_at 对应的本地时刻以会话速率起播，并开启收敛模式（RESUME_AT 执行后 10 秒）。 */
+    private fun executeCoordPlay() {
+        if (coordPlayLaunched) return
+        coordPlayLaunched = true
+        val localStart = if (role == "host") coordStartAtHostMs else coordStartAtHostMs - offsetMs
+        val delayMs = localStart - System.currentTimeMillis()
+        scope.launch {
+            if (delayMs > 0) delay(delayMs)
+            val pp = player ?: return@launch
+            coordPlayPending = null
+            coordSeekActive = false
+            pp.setPlaybackSpeed(sessionRate)
+            appliedRate = sessionRate // 复位点：与 START/RESUME 同口径，实际速率回到会话速率（旧微调不带入收敛期）
+            rateState = fmtSpeed(sessionRate)
+            pp.play()
+            spinSeekPending = false // v0.7.4：RESUME_AT 已实际执行（定点起播）——seek 未决解除；仍缓冲则由 buffer 条件接续显示
+            updateSpin()
+            started = true
+            localPaused = false
+            playbackEnded = false
+            acquirePlayWakeLock()
+            enterPlaybackUi()
+            convUntilMs = System.currentTimeMillis() + CONV_WINDOW_MS
+            convGoodTicks = 0
+            if (role == "host") playPauseBtn?.text = "暂停"
+            klog("RESUME_AT play executed start_at=$coordStartAtHostMs role=$role no=$myNo")
+        }
     }
 
     private fun cycleRate() {
@@ -1517,6 +1920,7 @@ class MainActivity : Activity() {
             started = true
             localPaused = false
             playbackEnded = false
+            updateSpin() // v0.7.4：恢复起播已执行——意图转播放，若仍在缓冲由 buffer 条件接续显示转圈
             acquirePlayWakeLock()
             enterPlaybackUi()
             klog("RESUME play() executed pos=${p.currentPosition} rate=$sessionRate role=$role no=$myNo")
@@ -1529,6 +1933,17 @@ class MainActivity : Activity() {
         if (isBiliInput(url)) {
             setStatus("正在解析 B 站链接…")
             scope.launch(Dispatchers.IO) { resolveBili(url) }
+            return
+        }
+        if (isDouyinInput(url)) {
+            setStatus("正在解析抖音链接…")
+            scope.launch { resolveDouyin(url) }
+            return
+        }
+        if (isDouyinIdInput(url)) {
+            // v0.7.3：纯数字作品 ID 直入抖音解析（第二步 WebView 捕获），不得落入下面的直链路径
+            setStatus("正在解析抖音链接…")
+            scope.launch { resolveDouyin(url) }
             return
         }
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
@@ -1645,6 +2060,265 @@ class MainActivity : Activity() {
             applyHostLink(playUrl)
             setStatus("B 站视频：$title")
         }
+    }
+
+    // ---------- v0.7.2：抖音分享链接解析（主机侧；WebView 捕获路线。纯 HTTP 接口路线已被实测排除：SSR 无播放地址、旧 iteminfo 返回空、无签名 detail 接口被 ArgusSecurityPlugin 拦截） ----------
+    private val DOUYIN_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    private val DOUYIN_REFERER = "https://www.douyin.com/"
+    private val DOUYIN_TIMEOUT_MS = 20000L // 解析总时限 20 秒（任务书钉死），超时报解析失败、不阻塞其他入口
+
+    /** v0.7.3 第五种抖音输入形态：纯数字作品 ID（去除首尾空白后为纯数字、长度 10 至 25 位）。不走直链路径。 */
+    private fun isDouyinIdInput(raw: String): Boolean = Regex("^\\d{10,25}$").matches(raw.trim())
+
+    /** 抖音形态判定：v.douyin.com 短链 / www.douyin.com/video 完整链接 / iesdouyin.com 分享链接（含混在分享文本整段里的）。与 B 站判定同构。 */
+    private fun isDouyinInput(raw: String): Boolean {
+        val url = extractFirstHttpUrl(raw.trim()) ?: return false
+        val host = Uri.parse(url).host ?: return false
+        if (host == "v.douyin.com") return true
+        if (host == "iesdouyin.com" || host.endsWith(".iesdouyin.com")) return true
+        if (host == "www.douyin.com" && url.contains("/video/")) return true
+        return false
+    }
+
+    private class DouyinHttp(val status: Int, val finalUrl: String)
+
+    /** 抖音第一步 GET：普通 HTTP 只跟随重定向取最终地址（不读 body 解析），移动端 UA、无 Cookie。 */
+    private fun douyinHttpHead(url: String): DouyinHttp {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.instanceFollowRedirects = true
+        conn.connectTimeout = 8000
+        conn.readTimeout = 8000
+        conn.setRequestProperty("User-Agent", DOUYIN_UA)
+        val status = conn.responseCode
+        val finalUrl = conn.url?.toString() ?: url
+        conn.disconnect()
+        return DouyinHttp(status, finalUrl)
+    }
+
+    private suspend fun douyinFail(stage: String, code: Any) {
+        klog("DOUYIN resolve fail stage=$stage code=$code")
+        withContext(Dispatchers.Main) { setStatus("抖音解析失败（阶段 $stage，code=$code），可改用直链或本地文件") }
+    }
+
+    /**
+     * 抖音解析主链：第一步普通 HTTP 跟随重定向、从最终地址提取作品 id；第二步主机内置 WebView 加载分享页，
+     * 由抖音页面自身脚本完成签名请求后两路捕获、先得者为准——甲路拦截媒体请求（douyinvod 域名或 .mp4），
+     * 乙路读 video 元素 currentSrc。总时限 20 秒；超时或失败只报阶段，不崩溃、不阻塞其他输入方式。
+     * 捕获所得地址写入既有 PREPARE 的 url 字段下发（经 applyHostLink，与 B 站解析同路）。
+     * v0.7.3：纯数字 ID 输入跳过第一步、直入第二步（见 isDouyinIdInput）；第二步带捕获增强与页面诊断（见 captureDouyinMedia）。
+     * v0.7.4：第二步加载地址改候选阶梯（第一步最终地址→构造 iesdouyin→m.douyin.com），主框架加载出错自动换下一候选（见 captureDouyinMedia）。
+     */
+    private suspend fun resolveDouyin(raw: String) {
+        val t0 = System.currentTimeMillis()
+        val trimmed = raw.trim()
+        val workId: String
+        val pageUrl: String
+        val candidates: List<String>
+        val budgetMs: Long
+        if (isDouyinIdInput(trimmed)) {
+            // v0.7.3 第五形态：纯数字 ID 跳过第一步（无链接可跟随重定向），直入第二步；
+            // WebView 加载地址定为 iesdouyin 分享页，预算为完整 20 秒
+            // v0.7.4：无第一步时候选阶梯 = 构造 iesdouyin 地址 → m.douyin.com 地址
+            workId = trimmed
+            pageUrl = "https://www.iesdouyin.com/share/video/$workId/"
+            candidates = listOf(pageUrl, "https://m.douyin.com/share/video/$workId")
+            budgetMs = DOUYIN_TIMEOUT_MS
+            klog("DOUYIN idinput id=$workId phost=www.iesdouyin.com")
+        } else {
+            val link = extractFirstHttpUrl(trimmed)
+            if (link == null) { douyinFail("redirect", "nolink"); return }
+            val head = withContext(Dispatchers.IO) {
+                try { douyinHttpHead(link) } catch (e: Exception) { null }
+            }
+            if (head == null) { douyinFail("redirect", "io"); return }
+            if (head.status !in 200..399) { douyinFail("redirect", head.status); return }
+            pageUrl = head.finalUrl
+            val wid = Regex("/video/(\\d+)").find(pageUrl)?.groupValues?.get(1)
+            if (wid == null) { douyinFail("redirect", "noid"); return }
+            workId = wid
+            klog("DOUYIN step1 ok id=$workId phost=${Uri.parse(pageUrl).host}")
+            // v0.7.4 地址阶梯：第一步最终地址 → 构造 iesdouyin 地址 → m.douyin.com 地址（去重保序，已试不重试）
+            candidates = listOf(
+                pageUrl,
+                "https://www.iesdouyin.com/share/video/$workId/",
+                "https://m.douyin.com/share/video/$workId"
+            ).distinct()
+            budgetMs = (DOUYIN_TIMEOUT_MS - (System.currentTimeMillis() - t0)).coerceAtLeast(3000L)
+        }
+        val mediaUrl = captureDouyinMedia(candidates, budgetMs)
+        if (mediaUrl.isNullOrEmpty()) { douyinFail("webview", "timeout"); return }
+        klog("DOUYIN resolve ok id=$workId mhost=${Uri.parse(mediaUrl).host}")
+        withContext(Dispatchers.Main) {
+            applyHostLink(mediaUrl)
+            setStatus("抖音视频已解析，等 prepare 完成后点「准备」下发")
+        }
+    }
+
+    /**
+     * WebView 捕获（建、载、毁都在主线程）：解析期临时把 WebView 以 1px、INVISIBLE 挂到内容根视图
+     * （不可见但不 GONE——GONE 会停掉渲染与脚本计时）；捕获成功或超时后立即停载、摘除并销毁，
+     * WebView 只在解析期间存在，绝不进入播放期。返回捕获到的媒体地址，超时或失败返回 null。
+     * v0.7.3：捕获轮询每 500ms 读页面状态（video 存在性/readyState/currentSrc 域名/title/页面域名），
+     * 解析结束打一行 DOUYIN page（含命中的捕获路 via）；页面加载后仍未捕获时依次动用静音 play() 与派发 click 两手增强。
+     * v0.7.4 抗错：①导航拦截——页面发起的非 http/https 导航（如唤起 App 的 scheme）一律拦下（DOUYIN navblock），
+     * 页面停留在当前 https 地址；②错误记录——主框架 onReceivedError/onReceivedHttpError 记入 DOUYIN page 行的
+     * err/failhost 字段；③地址阶梯——主框架加载出错即按候选顺序换下一地址重试（DOUYIN retry），已试不重复，
+     * 阶梯共用总时限。实证背景：2026-11-14 作品 7707678981859904794 在真机 WebView 停在浏览器错误页
+     * （title=「网页无法打开」、pagehost=chromewebdata），同机同期另一作品加载成功，服务器侧不区分两作品。
+     */
+    private suspend fun captureDouyinMedia(candidates: List<String>, budgetMs: Long): String? {
+        val deferred = CompletableDeferred<String?>()
+        var wv: WebView? = null
+        // v0.7.3 诊断与增强状态（WebView 回调与轮询协程均在主线程串行执行，普通变量即可）：
+        // captureVia=最终命中的捕获路（request/videosrc）；pageFinished 后仍未捕获才依次动用两手增强
+        var captureVia: String? = null
+        var pageFinished = false
+        var playTried = false
+        var clickTried = false
+        var lastPageState = "hasVideo=- readyState=- srchost=- title=- pagehost=-"
+        // v0.7.4 阶梯状态：candidateIdx=当前候选序号；loadSeq=每次 loadUrl 自增的载入代号，
+        // handledSeq=已处理过出错换址的那一代（防 onReceivedError 与 onReceivedHttpError 对同一载入重复换址）
+        var candidateIdx = 0
+        var loadSeq = 0
+        var handledSeq = -1
+        var lastErr: String? = null
+        var failHost = "-"
+        // v0.7.4：主框架出错换址——只处理当前这一代载入的首次出错；换址后本页的两手增强与 pageFinished 复位重走
+        fun advanceLadder() {
+            if (deferred.isCompleted) return
+            if (handledSeq == loadSeq) return
+            handledSeq = loadSeq
+            candidateIdx++
+            val next = candidates.getOrNull(candidateIdx) ?: return
+            loadSeq++
+            pageFinished = false
+            playTried = false
+            clickTried = false
+            klog("DOUYIN retry host=${Uri.parse(next).host ?: "-"}")
+            wv?.loadUrl(next)
+        }
+        withContext(Dispatchers.Main) {
+            val view = WebView(this@MainActivity)
+            wv = view
+            view.settings.javaScriptEnabled = true
+            view.settings.domStorageEnabled = true
+            view.settings.mediaPlaybackRequiresUserGesture = false
+            view.settings.userAgentString = DOUYIN_UA
+            view.webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest?): Boolean {
+                    val u = request?.url
+                    val scheme = u?.scheme?.lowercase()
+                    if (scheme != null && scheme != "http" && scheme != "https") {
+                        klog("DOUYIN navblock scheme=$scheme host=${u.host ?: "-"}")
+                        return true
+                    }
+                    return false
+                }
+
+                override fun onReceivedError(v: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                    if (request?.isForMainFrame == true) {
+                        val desc = (error?.description?.toString() ?: "").replace(" ", "_")
+                        lastErr = "${error?.errorCode ?: "?"}:$desc"
+                        failHost = request.url?.host ?: "-"
+                        advanceLadder()
+                    }
+                }
+
+                override fun onReceivedHttpError(v: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
+                    if (request?.isForMainFrame == true) {
+                        lastErr = "http${errorResponse?.statusCode ?: "?"}"
+                        failHost = request.url?.host ?: "-"
+                        advanceLadder()
+                    }
+                }
+
+                override fun shouldInterceptRequest(v: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                    val u = request?.url?.toString()
+                    if (u != null && !deferred.isCompleted) {
+                        val h = Uri.parse(u).host ?: ""
+                        if (h.contains("douyinvod") || u.contains(".mp4")) {
+                            captureVia = "request"
+                            klog("DOUYIN capture via=request mhost=$h")
+                            deferred.complete(u)
+                        }
+                    }
+                    return null
+                }
+
+                override fun onPageFinished(v: WebView?, url: String?) {
+                    pageFinished = true
+                    v?.evaluateJavascript(
+                        "(function(){var e=document.querySelector('video');return e?(e.currentSrc||e.src||''):''})()"
+                    ) { value ->
+                        val src = (value ?: "").trim().trim('"').replace("\\/", "/")
+                        if (src.startsWith("http") && !deferred.isCompleted) {
+                            captureVia = "videosrc"
+                            klog("DOUYIN capture via=videosrc mhost=${Uri.parse(src).host}")
+                            deferred.complete(src)
+                        }
+                    }
+                }
+            }
+            val parent = findViewById<ViewGroup>(android.R.id.content)
+            parent.addView(view, ViewGroup.LayoutParams(1, 1))
+            view.visibility = View.INVISIBLE
+            view.loadUrl(candidates[0])
+        }
+        // v0.7.3 捕获轮询（每 500ms）：①读页面状态存档，解析结束时打 DOUYIN page 行；
+        // ②顺手复查 video 元素 currentSrc（乙路，页面中途才给出地址的情形）；③页面加载后仍未捕获时
+        // 依次动用甲手（video 静音后 play()）、乙手（对 video 元素派发 click），各只触发一次
+        val pollJob = scope.launch(Dispatchers.Main) {
+            while (!deferred.isCompleted) {
+                delay(500)
+                if (deferred.isCompleted) break
+                val view = wv ?: break
+                view.evaluateJavascript(
+                    "(function(){var e=document.querySelector('video');var s=e?(e.currentSrc||e.src||''):'';var sh='-';if(s){try{sh=new URL(s).hostname||'-'}catch(x){sh='?'}}return (e?'1':'0')+'|'+(e?e.readyState:-1)+'|'+sh+'|'+encodeURIComponent(document.title||'')+'|'+(location.hostname||'-')})()"
+                ) { value ->
+                    val raw = (value ?: "").trim().trim('"').replace("\\/", "/")
+                    val parts = raw.split("|")
+                    if (parts.size >= 5) {
+                        val title = try { java.net.URLDecoder.decode(parts[3], "UTF-8") } catch (e: Exception) { parts[3] }
+                        lastPageState = "hasVideo=${parts[0]} readyState=${parts[1]} srchost=${parts[2]} title=$title pagehost=${parts[4]}"
+                    }
+                }
+                view.evaluateJavascript(
+                    "(function(){var e=document.querySelector('video');return e?(e.currentSrc||e.src||''):''})()"
+                ) { value ->
+                    val src = (value ?: "").trim().trim('"').replace("\\/", "/")
+                    if (src.startsWith("http") && !deferred.isCompleted) {
+                        captureVia = "videosrc"
+                        klog("DOUYIN capture via=videosrc mhost=${Uri.parse(src).host}")
+                        deferred.complete(src)
+                    }
+                }
+                if (!pageFinished || deferred.isCompleted) continue
+                if (!playTried) {
+                    playTried = true
+                    view.evaluateJavascript(
+                        "(function(){var e=document.querySelector('video');if(!e)return 'novideo';e.muted=true;e.play();return 'played'})()",
+                        null
+                    )
+                } else if (!clickTried) {
+                    clickTried = true
+                    view.evaluateJavascript(
+                        "(function(){var e=document.querySelector('video');if(!e)return 'novideo';e.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));return 'clicked'})()",
+                        null
+                    )
+                }
+            }
+        }
+        val result = try { withTimeoutOrNull(budgetMs) { deferred.await() } } catch (e: Exception) { null }
+        pollJob.cancel()
+        klog("DOUYIN page via=${captureVia ?: "none"} $lastPageState err=${lastErr ?: "-"} failhost=$failHost")
+        withContext(Dispatchers.Main) {
+            wv?.let {
+                it.stopLoading()
+                (it.parent as? ViewGroup)?.removeView(it)
+                it.destroy()
+            }
+        }
+        return result
     }
 
     /** 本轮 PREPARE 的 url：直链用直链；本地文件且有从机连接时启动分发服务用分发地址；否则 local-file 占位。 */
@@ -1942,7 +2616,9 @@ class MainActivity : Activity() {
         tickJob?.cancel()
         tickJob = scope.launch {
             while (true) {
-                delay(5000)
+                // v0.7.1 收敛模式（协议 §18）：协同 seek 收集期／RESUME_AT 待执行／收敛期 10 秒内 TICK 间隔 1000ms，其余 5000ms
+                val conv = seekSchedActive || coordPlayPending == true || System.currentTimeMillis() < convUntilMs
+                delay(if (conv) CONV_TICK_MS else 5000)
                 val p = player ?: break
                 if (started) {
                     server?.broadcast(msg("TICK").put("host_clock", System.currentTimeMillis())
@@ -2076,7 +2752,7 @@ class MainActivity : Activity() {
     }
 
     // ---------- v0.6.0：主机覆盖层分页 ----------
-    /** 分页签切换：只切四页容器显隐与页签选中态（样式沿用布局胶囊的 styleModePill），不触碰任何业务状态。 */
+    /** 分页签切换：只切三页容器显隐与页签选中态（样式沿用布局胶囊的 styleModePill），不触碰任何业务状态。v0.7.4 起三页：视频／连接／更多。 */
     private fun selectHostPage(key: String) {
         hostPageBoxes.forEach { (k, page) -> page.visibility = if (k == key) View.VISIBLE else View.GONE }
         hostTabBtns.forEach { (k, b) -> styleModePill(b, k == key) }
@@ -2091,6 +2767,7 @@ class MainActivity : Activity() {
         stopXferServer("session_end")
         stopMediaServer()
         try { player?.pause() } catch (e: Exception) {}
+        spinReset() // v0.7.4：结束会话回角色选择——转圈复位隐藏，不残留在大厅之上
         started = false; sessionActive = false; playbackEnded = false; localPaused = false
         clientConns.clear(); clientReady.clear(); clientFailed.clear(); clientExited.clear(); deviceSizes.clear()
         updateKeepScreenOn()
@@ -2103,7 +2780,7 @@ class MainActivity : Activity() {
     /**
      * 主机「退出播放／退出此视频」：广播 STOP 结束当前视频的播放会话，本机同步执行同一清除（execStopPlayback）。
      * 组会不散——连接、编号、布局模式与 fit 选择全部保留，退出后重新选片即可再走 PREPARE→START。
-     * 发起入口仅主机有两处（同一处理函数）：常显工具条「退出播放」按钮、面板「播放」页同名按钮；从机不设发起入口。
+     * 发起入口仅主机有两处（同一处理函数）：常显工具条「退出播放」按钮、面板「视频」页同名按钮；从机不设发起入口。
      */
     private fun hostStopPlayback() {
         if (role != "host") return
@@ -2120,6 +2797,7 @@ class MainActivity : Activity() {
      * 注意：从机执行 STOP 不回 EXIT_PLAYBACK（那是本机主动退出的通知语义），主机侧退出标记不因 STOP 增减。
      */
     private fun execStopPlayback() {
+        spinReset() // v0.7.4：STOP——转圈复位隐藏
         val cleared = mediaKind != "none" || started || playbackEnded || mediaReady || remoteMediaUrl != null
         tickJob?.cancel(); tickJob = null
         remoteTimeoutJob?.cancel()
@@ -2672,6 +3350,7 @@ class MainActivity : Activity() {
     }
 
     // ---------- v0.7.0：播放侧请求头——bilivideo/upos 域名带 B 站 Referer 与桌面 UA（无此头 CDN 回 403），其余地址走默认数据源、行为与旧版一致 ----------
+    // ---------- v0.7.2：同路扩展 douyinvod 域名——带抖音 Referer 与解析一致的移动端 UA（规则与 B 站分支对齐，类名沿用不改） ----------
     private inner class BiliAwareDataSourceFactory : DataSource.Factory {
         override fun createDataSource(): DataSource = BiliAwareDataSource(this@MainActivity)
     }
@@ -2680,6 +3359,9 @@ class MainActivity : Activity() {
         private val biliHttpFactory = DefaultHttpDataSource.Factory()
             .setUserAgent(BILI_UA)
             .setDefaultRequestProperties(mapOf("Referer" to BILI_REFERER))
+        private val douyinHttpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(DOUYIN_UA)
+            .setDefaultRequestProperties(mapOf("Referer" to DOUYIN_REFERER))
         private val defaultFactory = DefaultDataSource.Factory(context)
         private val listeners = ArrayList<TransferListener>()
         private var delegate: DataSource? = null
@@ -2693,7 +3375,8 @@ class MainActivity : Activity() {
         override fun open(dataSpec: DataSpec): Long {
             val host = dataSpec.uri.host ?: ""
             val bili = host.contains("bilivideo") || host.contains("upos")
-            val d = (if (bili) biliHttpFactory else defaultFactory).createDataSource()
+            val douyin = host.contains("douyinvod")
+            val d = (if (bili) biliHttpFactory else if (douyin) douyinHttpFactory else defaultFactory).createDataSource()
             for (l in listeners) d.addTransferListener(l)
             delegate = d
             return d.open(dataSpec)
@@ -2725,7 +3408,18 @@ class MainActivity : Activity() {
         trackSelector.setParameters(
             trackSelector.buildUponParameters().setMaxVideoSize(dm.widthPixels, dm.heightPixels)
         )
+        // v0.7.1 缓冲门槛（协议 §18）：bufferForPlaybackAfterRebufferMs=1000（media3 默认 5000），其余缓冲参数保持默认。
+        // 全局生效：本机所有播放（主机本地/直链/B 站、从机分发/直链）共用此 setupPlayer，普通卡顿恢复同受此门槛——
+        // 卡后攒够 1 秒缓冲即恢复播放（恢复更快），代价是弱网下缓冲垫变薄、刚恢复即再卡的概率上升。
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+                DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,
+                DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
+                BUFFER_AFTER_REBUFFER_MS
+            ).build()
         val p = ExoPlayer.Builder(this).setTrackSelector(trackSelector)
+            .setLoadControl(loadControl)
             .setMediaSourceFactory(DefaultMediaSourceFactory(BiliAwareDataSourceFactory()))
             .build()
         klog("TRACKCAP max=${dm.widthPixels}x${dm.heightPixels} screen=${dm.widthPixels}x${dm.heightPixels}")
@@ -2734,6 +3428,8 @@ class MainActivity : Activity() {
         if (role == "client") p.volume = 0f
         p.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
+                spinBuffering = state == Player.STATE_BUFFERING // v0.7.4：转圈 buffer 条件的状态源（显隐在 updateSpin 按意图过滤）
+                updateSpin()
                 if (state == Player.STATE_READY && !started) {
                     mediaReady = true
                     remoteTimeoutJob?.cancel() // v0.3.2：15 秒内到达 READY，备片超时计时作废
@@ -2762,12 +3458,22 @@ class MainActivity : Activity() {
                 if (state == Player.STATE_ENDED && started) {
                     started = false
                     playbackEnded = true
+                    spinReset() // v0.7.4：自然播完——转圈复位隐藏
                     klog("playback ended role=$role no=$myNo")
                     releasePlayWakeLock("ended")
                     if (role == "host") playPauseBtn?.text = "重新起播"
                     exitPlaybackUi()
                     setStatus("播放结束")
                 }
+            }
+            override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
+                // v0.7.1：media3 1.4.1 的 Player.Listener 无 onSeekProcessed（那是 ExoPlayer 2.x 旧 API）；
+                // 以 DISCONTINUITY_REASON_SEEK 的位置跳变作为等价信号（任务书「或等价信号」），即协同 seek 就绪条件一
+                if (reason == Player.DISCONTINUITY_REASON_SEEK) coordSeekProcessed = true
+            }
+            override fun onPlayerError(error: PlaybackException) {
+                // v0.7.1：协同 seek 期间播放器报错即判 FAIL（reason 记错误原文）；非协同 seek 期间不介入
+                if (coordSeekActive && !coordReadySent) onCoordFail(role == "host", "player_error:${error.errorCodeName}")
             }
             override fun onRenderedFirstFrame() {
                 if (started) klog("first frame rendered at wallclock=${System.currentTimeMillis()}")
@@ -3012,6 +3718,7 @@ class MainActivity : Activity() {
             started = true
             localPaused = false
             playbackEnded = false
+            updateSpin() // v0.7.4：START 起播已执行——若仍在缓冲由 buffer 条件显示转圈
             acquirePlayWakeLock()
             enterPlaybackUi()
             val err = before - localStart
@@ -3101,6 +3808,17 @@ class MainActivity : Activity() {
         val wasFirstTick = firstTickAfterStart
         if (firstTickAfterStart) firstTickAfterStart = false // v0.3.3：只作日志区分（first=1），不再驱动单独 seek 分支；FIRST_TICK_ALIGN 50ms 特例删除
         val absErr = abs(err)
+        // v0.7.1 收敛期提前结束判定（协议 §18）：连续两次 TICK 的 |err| 均 <=50ms 即提前结束收敛期。
+        // 收敛期内的纠偏动作与现行口径同体——任务书收敛段的速率公式/钳位/死区、灾难 seek 条件（>2000ms）
+        // 与 8 秒冷却本就按 v0.3.3 现行口径写定，下方 when 分支即其实现；收敛期与常态的差别只在
+        // 主机 TICK cadence（1000ms）与本提前结束判定。
+        if (System.currentTimeMillis() < convUntilMs) {
+            if (absErr <= 50) convGoodTicks++ else convGoodTicks = 0
+            if (convGoodTicks >= 2) {
+                convUntilMs = 0; convGoodTicks = 0
+                klog("CONV end early err=${err}ms")
+            }
+        }
         when {
             absErr <= 30 -> {
                 // 死区：不校正；实际速率若偏离会话速率，先恢复为会话速率（rate-restore）
@@ -4240,6 +4958,8 @@ class MainActivity : Activity() {
         override fun onClose(conn: WebSocket, code: Int, reason: String, remote: Boolean) {
             val no = clientConns.entries.firstOrNull { it.value == conn }?.key
             if (no != null) { clientConns.remove(no); clientReady.remove(no); clientFailed.remove(no); clientExited.remove(no); deviceSizes.remove(no); refreshDevicesTv() }
+            // v0.7.1 主机流程 8：协同 seek 收集期间从机断开——该机已移出收集集合（上行已移除），立即复查决策点
+            if (no != null && seekSchedActive) maybeSendResumeAt()
             // v0.6.1：播放期成员掉线即按活跃集自动重排（画面补齐、播放不中断）
             if (no != null && inPlaybackSession() && currentMode != null) relayout("disconnect")
             klog("server: conn closed no=$no reason=$reason")
@@ -4338,6 +5058,24 @@ class MainActivity : Activity() {
                         klog("PREPARE_FAIL no=$no reason=$reason")
                         setStatus("从机 $no 备片失败：$reasonCn")
                         hostMaybeStart()
+                    }
+                    "SEEK_READY" -> {
+                        // v0.7.1（协议 §18）：从机协同 seek 就绪回报——记入收集表并复查决策点
+                        val no = clientConns.entries.firstOrNull { it.value == conn }?.key ?: -1
+                        if (no >= 0) {
+                            seekReplies[no] = "READY"
+                            klog("server: SEEK_READY no=$no ready_ms=${o.optLong("ready_ms")}")
+                            maybeSendResumeAt()
+                        }
+                    }
+                    "SEEK_FAIL" -> {
+                        // v0.7.1（协议 §18）：从机协同 seek 失败回报——记入收集表并复查决策点（失败不阻塞全场决策）
+                        val no = clientConns.entries.firstOrNull { it.value == conn }?.key ?: -1
+                        if (no >= 0) {
+                            seekReplies[no] = "FAIL"
+                            klog("server: SEEK_FAIL no=$no reason=${o.optString("reason", "")}")
+                            maybeSendResumeAt()
+                        }
                     }
                     "STAT" -> klog("server: STAT $message")
                     "RESYNC" -> klog("server: RESYNC $message")
@@ -4444,6 +5182,7 @@ class MainActivity : Activity() {
                             klog("PAUSE ignored (not started) media_pos_ms=$pos")
                         }
                         localPaused = true
+                        updateSpin() // v0.7.4：用户暂停（主机命令）——buffer 条件失效，转圈重算
                         releasePlayWakeLock("host pause")
                     }
                     "RESUME" -> {
@@ -4468,6 +5207,30 @@ class MainActivity : Activity() {
                             klog("SEEK exec media_pos_ms=$pos paused=$localPaused")
                         } else {
                             klog("SEEK ignored (not started) media_pos_ms=$pos")
+                        }
+                    }
+                    "SEEK_SCHED" -> runOnUiThread {
+                        // v0.7.1（协议 §18）：协同 seek 调度——主机拖动开始时已广播 PAUSE，本机应已暂停；
+                        // 此处兜底置暂停态后立即走从机流程（暂停态 EXACT seek + 双条件就绪判定）
+                        val pos = o.optLong("pos_ms")
+                        if (player != null && started) {
+                            localPaused = true
+                            player?.pause()
+                            startCoordSeek(pos, fromHost = false)
+                            klog("SEEK_SCHED recv pos=$pos floor_at=${o.optLong("floor_at")} cap_at=${o.optLong("cap_at")} was_playing=${o.optBoolean("was_playing")}")
+                        } else {
+                            klog("SEEK_SCHED ignored (not started) pos=$pos")
+                        }
+                    }
+                    "RESUME_AT" -> runOnUiThread {
+                        // v0.7.1（协议 §18）：定点恢复——play=true 在 start_at 经对时换算的本地时刻齐播（未就绪者迟到补播）；play=false 停在 pos 保持暂停
+                        val startAt = o.optLong("start_at")
+                        val play = o.optBoolean("play")
+                        if (started) {
+                            applyResumeAtLocal(startAt, play)
+                            klog("RESUME_AT recv start_at=$startAt play=$play")
+                        } else {
+                            klog("RESUME_AT ignored (not started) start_at=$startAt play=$play")
                         }
                     }
                     "RATE" -> runOnUiThread {
@@ -4517,6 +5280,7 @@ class MainActivity : Activity() {
         }
         override fun onClose(code: Int, reason: String, remote: Boolean) {
             klog("client: ws closed $reason")
+            spinReset() // v0.7.4：断线——转圈复位隐藏
             sessionActive = false
             updateKeepScreenOn()
             releasePlayWakeLock("ws closed")

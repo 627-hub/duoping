@@ -11,8 +11,8 @@ android {
         applicationId = "app.duoping.kernel"
         minSdk = 26
         targetSdk = 35
-        versionCode = 16
-        versionName = "0.7.0-bili"
+        versionCode = 21
+        versionName = "0.7.5"
     }
 
     buildTypes {
